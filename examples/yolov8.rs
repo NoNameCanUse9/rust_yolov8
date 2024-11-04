@@ -1,11 +1,14 @@
 #![allow(clippy::manual_retain)]
 
+use std::option;
 use std::path::Path;
-
+use opencv::prelude::*;
+use opencv::{imgcodecs, imgproc,core};
 use image::{imageops::FilterType, GenericImageView};
 use ndarray::{s, Array, Axis};
 use ort::{inputs, ROCmExecutionProvider, Session, 
     SessionOutputs,CUDAExecutionProvider,CPUExecutionProvider,Error};
+use tracing_subscriber::fmt::writer::MutexGuardWriter;
 
 #[derive(Debug, Clone, Copy)]
 struct BoundingBox {
@@ -45,16 +48,20 @@ struct ResultBox {
     prob: f32,
 }
 
-struct YOLOv8_DETECTIOR {
+struct Yolov8Detectior {
     model: Session,
-    img_size: (u32, u32),
-     boxes:  Vec<ResultBox>,
+    img_size: (i32, i32),
+    boxes:  Vec<ResultBox>,
+    infer_mat: Mat,
+    scale: Option<f32>,
+    pad_w: Option<i32>,
+    pad_h: Option<i32>,
    
 
 }
 
-impl YOLOv8_DETECTIOR {
-    pub fn new(env_name: &str, model_name: &str, imgze : (u32, u32)) -> Result<Self, ort::Error> {
+impl Yolov8Detectior {
+    pub fn new(env_name: &str, model_name: &str, imgze : (i32, i32)) -> Result<Self, ort::Error> {
         let model = match env_name {
             "rocm" => {
                 ort::init()
@@ -80,29 +87,70 @@ impl YOLOv8_DETECTIOR {
         Ok(Self { model ,
             img_size: imgze,
             boxes: Vec::new(),
-        
+            infer_mat: Mat::default(),
+            scale: None, // 初始化为 None
+            pad_w: None, // 初始化为 None
+            pad_h: None, // 初始化为 None
         })
     }
   
-    fn load_images(&self, image_bytes: &[u8]) -> Array<f32, ndarray::Dim<[usize; 4]>> {
-        let original_img = image::load_from_memory(image_bytes).unwrap();
-        let (img_width, img_height) = (original_img.width(), original_img.height());
-        let img = original_img.resize_exact(self.img_size.0, self.img_size.1, FilterType::CatmullRom);
-        let mut input = Array::zeros((1, 3, 640, 640));
-        for pixel in img.pixels() {
-            let x = pixel.0 as usize;
-            let y = pixel.1 as usize;
-            let [r, g, b, _] = pixel.2.0;
-            input[[0, 0, y, x]] = (r as f32) / 255.;
-            input[[0, 1, y, x]] = (g as f32) / 255.;
-            input[[0, 2, y, x]] = (b as f32) / 255.;
-        }
-        input
+    // fn load_images(&self, image_bytes: &[u8]) -> Array<f32, ndarray::Dim<[usize; 4]>> {
+    //     let original_img = image::load_from_memory(image_bytes).unwrap();
+    //     let (img_width, img_height) = (original_img.width(), original_img.height());
+    //     let img = original_img.resize_exact(self.img_size.0, self.img_size.1, FilterType::CatmullRom);
+    //     let mut input = Array::zeros((1, 3, 640, 640));
+    //     for pixel in img.pixels() {
+    //         let x = pixel.0 as usize;
+    //         let y = pixel.1 as usize;
+    //         let [r, g, b, _] = pixel.2.0;
+    //         input[[0, 0, y, x]] = (r as f32) / 255.;
+    //         input[[0, 1, y, x]] = (g as f32) / 255.;
+    //         input[[0, 2, y, x]] = (b as f32) / 255.;
+    //     }
+    //     input
+    // }
+    fn letterbox(&mut self,) -> Result<Mat, opencv::Error> {
+        let mat = self.infer_mat.clone();
+        let (h, w) = (mat.rows(), mat.cols());
+        let scale = (self.img_size.0 as f32 / w as f32).min(self.img_size.1 as f32 / h as f32);
+       
+        let new_w = (w as f32 * scale).round() as i32;
+        let new_h = (h as f32 * scale).round() as i32;
+        let pad_w = (self.img_size.0 - new_w) / 2;
+        let pad_h = (self.img_size.1 - new_h) / 2;
+        let mut resized_img = Mat::default();
+        opencv::imgproc::resize(&mat, &mut resized_img, core::Size { width: new_w, height: new_h }, 0.0, 0.0, imgproc::INTER_LINEAR)?;
+        let mut padded_img = Mat::default();
+        opencv::core::copy_make_border(&resized_img, &mut padded_img, pad_h, pad_h, pad_w, pad_w, opencv::core::BORDER_CONSTANT, opencv::core::Scalar::all(255.0))?;
+        self.scale = Some(scale);
+        //保存图片
+        self.pad_w = Some(pad_w); // 设置 self.pad_w
+    self.pad_h = Some(pad_h); // 设置 self.pad_h
+        Ok(padded_img)
     }
+    
+   pub fn load_image_to_mat(& mut self,image_path: &str) -> Result<(), opencv::Error> {
+        // 加载图片
+        self.infer_mat= imgcodecs::imread(image_path, imgcodecs::IMREAD_COLOR)?;
+        
+        
+        // 创建一个临时变量来存储颜色转换后的图像
+    
+   
 
-    pub fn infer(&mut self, input: Array<f32, ndarray::Dim<[usize; 4]>>) -> Result<(), ort::Error> {
+        // 交换临时变量和原始变量的内容
+   
+        Ok(())
+         
+    }
+        
+    pub fn infer(&mut self, mat:& mut Mat ) -> Result<(), ort::Error> {
+    
         let (img_width, img_height) = self.img_size;
-        let outputs: SessionOutputs = self.model.run(inputs!["images" => input.view()]?)?;
+        let input_array = ndarray::Array4::<f32>::from_shape_fn((1, 3, 640, 640), |(_, c, y, x)| {
+            mat.at_2d::<core::Vec3b>(y as i32, x as i32).unwrap()[c] as f32 / 255.0
+        });
+        let outputs: SessionOutputs = self.model.run(inputs!["images" => input_array.view()]?)?;
         let output = outputs["output0"].try_extract_tensor::<f32>()?.t().into_owned();
 
         self.boxes.clear(); // 清空之前的检测结果
@@ -139,27 +187,74 @@ impl YOLOv8_DETECTIOR {
         Ok(())
     }
     pub fn nms(&mut self, iou_threshold: f32) -> Vec<ResultBox> {
-        self.boxes.sort_by(|box1, box2| box2.prob.total_cmp(&box1.prob));
-        let mut result = Vec::new();
-
+        self.boxes.sort_by(|box1: &ResultBox, box2: &ResultBox| box2.prob.total_cmp(&box1.prob));
+        let mut result: Vec<ResultBox> = Vec::new();
+    
         while !self.boxes.is_empty() {
-            result.push(self.boxes[0].clone());
+            let box1 = self.boxes.remove(0); // 移除第一个边界框
+            result.push(box1.clone());
+    
             self.boxes = self.boxes
                 .iter()
-                .filter(|box1| {
-                    let last_box = result.last().unwrap();
-                    BoundingBox::intersection(&last_box.bounding_box, &box1.bounding_box) / BoundingBox::union(&last_box.bounding_box, &box1.bounding_box) < iou_threshold
+                .filter(|&box2| {
+                    BoundingBox::intersection(&box1.bounding_box, &box2.bounding_box) / BoundingBox::union(&box1.bounding_box, &box2.bounding_box) < iou_threshold
                 })
                 .cloned()
                 .collect::<Vec<ResultBox>>();
         }
-
+    
+        // 转换回原图的坐标点
+        let scale = self.scale.unwrap_or(1.0); // 使用 self.scale
+        let pad_w = self.pad_w.unwrap_or(0); // 使用 self.pad_w
+        let pad_h = self.pad_h.unwrap_or(0); // 使用 self.pad_h
+    
+        for box1 in &mut result {
+            box1.bounding_box.x1 = (box1.bounding_box.x1 - pad_w as f32) / scale;
+            box1.bounding_box.y1 = (box1.bounding_box.y1 - pad_h as f32) / scale;
+            box1.bounding_box.x2 = (box1.bounding_box.x2 - pad_w as f32) / scale;
+            box1.bounding_box.y2 = (box1.bounding_box.y2 - pad_h as f32) / scale;
+        }
+    
+        println!("{:?}", result);
         result
     }
-      
-    
+    pub fn draw_boxes(&mut self , boxes:&Vec<ResultBox>) -> Result<(), opencv::Error> {
+        for box1 in boxes {
+          
+            let x1 = box1.bounding_box.x1 as i32;
+            let y1 = box1.bounding_box.y1 as i32;
+            let x2 = box1.bounding_box.x2 as i32;
+            let y2 = box1.bounding_box.y2 as i32;
+            let color = core::Scalar::new(0.0, 255.0, 0.0, 0.0);
+            let font = imgproc::FONT_HERSHEY_SIMPLEX;
+            let font_scale = 0.5;
+            let thickness = 1;
+            let mut baseline = 0;
+            let text = format!("{} {:.2}", box1.label, box1.prob);
+            let text_size = imgproc::get_text_size(&text, font, font_scale, thickness, &mut baseline)?;
+            let text_origin = core::Point::new(x1, y1 + text_size.height);
+            imgproc::rectangle(&mut self.infer_mat, core::Rect::new(x1, y1, x2 - x1, y2 - y1), color, 2, 8, 0)?;
+            imgproc::put_text(&mut self.infer_mat, &text, text_origin, font, font_scale, color, thickness, 8, false)?;
+        }
+        imgcodecs::imwrite("data/baseball_result.jpg", &self.infer_mat, &core::Vector::new())?;
+        Ok(())
+    }
+    pub fn inference (&mut self,image_path: &str ) {
+        self.load_image_to_mat(image_path).unwrap();
+        let mut mat = self.letterbox().unwrap();
+        self.infer(& mut mat).unwrap();
+        let result: Vec<ResultBox> = self.nms(0.5);
+        {
+            self.draw_boxes(&result).unwrap();}
+        {
+        //imgcodecs::imwrite("data/baseball_result.jpg", &mut self.infer_mat, &core::Vector::new()).unwrap();
+        }
 
+        
+    }
 }
+
+
 
 
 
@@ -177,11 +272,11 @@ const YOLOV8_CLASS_LABELS: [&str; 80] = [
 
 fn main() {
     tracing_subscriber::fmt::init();
-    let mut detector = YOLOv8_DETECTIOR::new("rocm", "yolov8s.onnx", (640, 640)).unwrap();
-    let image_bytes = std::fs::read(Path::new("data/baseball.jpg")).unwrap();
-    let input = detector.load_images(&image_bytes);
-    detector.infer(input).unwrap();
-    let result = detector.nms(0.5);
-    print!("{:?}", result);
+    let mut detector: Yolov8Detectior = Yolov8Detectior::new("rocm", "yolov8s.onnx", (640, 640)).unwrap();
+    // let image_bytes = std::fs::read(Path::new("data/baseball.jpg")).unwrap();
+    //detector.load_image_to_mat("data/baseball.jpg").unwrap();
+    
+   
+    detector.inference("data/baseball.jpg");
    
 }

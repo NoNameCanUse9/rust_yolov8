@@ -13,7 +13,7 @@ image = "0.25"
 #raqote = { version = "0.8", default-features = false }
 #ureq = "2.1"
 tracing = "0.1"
-
+opencv = "0.93.1"
 [features]
 load-dynamic = [ "ort/load-dynamic" ]
 rocm = [ "ort/rocm" ]
